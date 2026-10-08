@@ -11,11 +11,14 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import Literal, get_args
 
 from .state import atomic_json
 
 DEFAULT_MODEL_PATH = "speech/models/Confucius4-R2T2-GGUF"
 MODEL_FILES = ("Confucius4-R2T2-Q8_0.gguf", "mmproj-Confucius4-R2T2-Q8_0.gguf")
+SpeechLanguage = Literal["Auto", "Chinese", "English", "Cantonese", "Japanese", "Korean",
+                         "German", "French", "Russian", "Portuguese", "Spanish", "Italian"]
 
 
 class SpeechSessions:
@@ -91,7 +94,9 @@ class SpeechSessions:
                 self._manager = importlib.import_module("speech.bridge").manager
             return self._manager
 
-    def start(self, owner: str):
+    def start(self, owner: str, language: SpeechLanguage = "Auto"):
+        if language not in get_args(SpeechLanguage):
+            raise ValueError("不支持的语音识别语言")
         with self._lock:
             if not self.available:
                 raise RuntimeError("R2T2 语音模型或原生库未就绪，请在模型设置中选择已有语音模型目录")
@@ -110,13 +115,13 @@ class SpeechSessions:
                 finally:
                     self._owners.pop(sid, None)
             result = manager.start_live({"model_dir": str(self.resolve_model())}, {
-                "language": "Auto", "context": "", "stream_chunk_ms": 320,
+                "language": language, "context": "", "stream_chunk_ms": 320,
                 "min_segment_seconds": 4,
             })
             sid = result["session_id"]
             self._finished.pop(sid, None)  # A new native generation may reuse an ID.
             self._owners[sid] = owner
-        return {"session_id": sid, "sample_rate": result["sample_rate"]}
+        return {"session_id": sid, "sample_rate": result["sample_rate"], "language": language}
 
     def _owned(self, owner: str, sid: str):
         with self._lock:

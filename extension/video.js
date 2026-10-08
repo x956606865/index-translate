@@ -17,6 +17,32 @@
   let cancellationBarrier = Promise.resolve();
   let speechQueue = [], speechBusy = false, speechPumpGeneration = 0;
   let speechEpoch = '';
+  let speechLanguage = 'Auto';
+  let pageUrl = location.href;
+  const speechLanguages = {
+    Auto: 'Auto（自动识别）', Chinese: '中文', English: '英语', Cantonese: '粤语',
+    Japanese: '日语', Korean: '韩语', German: '德语', French: '法语',
+    Russian: '俄语', Portuguese: '葡萄牙语', Spanish: '西班牙语', Italian: '意大利语',
+  };
+  function checkPage() {
+    if (pageUrl === location.href) return;
+    pageUrl = location.href;
+    speechLanguage = 'Auto';
+    stop(true);
+  }
+  async function pageLanguage(message) {
+    if (message.expectedUrl !== location.href) throw new Error('页面已切换，请重新打开插件');
+    if (message.language !== undefined) {
+      if (!Object.hasOwn(speechLanguages, message.language)) throw new Error('不支持的语音识别语言');
+      const changed = speechLanguage !== message.language;
+      speechLanguage = message.language;
+      if (changed && active && mode === 'speech') {
+        const result = await seeked();
+        if (!result?.restarted) throw new Error(result?.error || '语言已保存，但语音会话未就绪，请重新点击「直接识别声音」');
+      }
+    }
+    return {language:speechLanguage, languages:speechLanguages};
+  }
   let speechEnded = false;
   let speechPausedAt = null, speechPauseTimer = null, speechPauseFinalizing = false;
 
@@ -320,11 +346,13 @@
     else if (active && mode === 'speech') {
       speechEpoch = crypto.randomUUID();
       const epoch = speechEpoch;
-      chrome.runtime.sendMessage({type:'VIDEO_AUDIO_RESTART_PAGE',speechEpoch:epoch}).then(reply => {
+      return chrome.runtime.sendMessage({type:'VIDEO_AUDIO_RESTART_PAGE',speechEpoch:epoch,speechLanguage}).then(reply => {
         if (active && mode === 'speech' && speechEpoch === epoch && (!reply?.ok || reply.value?.restarted === false))
           show('', '', reply?.error || '语音采集尚未启动，请重新点击「语音译」');
+        return reply?.ok ? reply.value : {restarted:false,error:reply?.error};
       }).catch(error => {
         if (active && mode === 'speech' && speechEpoch === epoch) show('', '', error.message);
+        return {restarted:false,error:error.message};
       });
     }
   }
@@ -535,7 +563,7 @@
       refreshScope();
     }, 1000);
     updateControls();
-    return {mode,speechEpoch};
+    return {mode,speechEpoch,speechLanguage};
   }
 
   function stop(notify = false) {
@@ -575,12 +603,18 @@
     if (wasSpeech) chrome.runtime.sendMessage({type:"VIDEO_AUDIO_STOP_PAGE"}).catch(() => {});
   }
 
-  chrome.runtime.onMessage.addListener((message, _sender, respond) => {
+  chrome.runtime.onMessage.addListener((message, sender, respond) => {
+    if (sender.id !== chrome.runtime.id) return;
+    checkPage();
+    if (message.type === 'IT_VIDEO_LANGUAGE') {
+      pageLanguage(message).then(value => respond({ok:true,value}), error => respond({ok:false,error:error.message}));
+      return true;
+    }
     if (message.type === 'IT_VIDEO_STATUS') {
       respond({active,mode,paused:!!video?.paused,note:controls.get(video)?.status.textContent || ''});
       return;
     }
-    if (message.type === 'IT_VIDEO_EPOCH') { respond({speechEpoch}); return; }
+    if (message.type === 'IT_VIDEO_EPOCH') { respond({speechEpoch,speechLanguage,active,mode}); return; }
     if (message.type === "IT_VIDEO_START") {
       start(!!message.forceSpeech, message.targetIndex).then(respond, error => respond({mode:"none",reason:error.message}));
       return true;
@@ -615,5 +649,6 @@
   }).observe(document.documentElement,{subtree:true,childList:true,attributes:true,
     attributeFilter:["src","title","allow","allowfullscreen","class","style","hidden"]});
   discoverControls();
-  addEventListener("pagehide", () => stop(true));
+  setInterval(checkPage, 750);
+  addEventListener("pagehide", () => { speechLanguage = 'Auto'; stop(true); });
 })();

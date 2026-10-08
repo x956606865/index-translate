@@ -25,7 +25,7 @@ from index_translate_core.inference import hardware, PROMPT_VERSION
 from index_translate_core.models import catalog, inspect_model
 from .state import State
 from .folder_picker import choose_directory
-from .speech_service import SpeechSessions
+from .speech_service import SpeechLanguage, SpeechSessions
 
 
 class StrictModel(BaseModel):
@@ -80,6 +80,10 @@ class Pair(StrictModel):
 class Download(StrictModel):
     model_id: str
     source: str = Field(default="modelscope", pattern=r"^(modelscope|huggingface)$")
+
+
+class SpeechStart(StrictModel):
+    language: SpeechLanguage = "Auto"
 
 
 class SpeechFeed(StrictModel):
@@ -363,10 +367,10 @@ def create_app(root=ROOT, state=None, port=8098):
         return speech_call(lambda: {"path": choose_directory(speech.resolve_model(), "选择 R2T2 语音识别模型文件夹")})
 
     @app.post("/api/speech/start")
-    def speech_start(request: Request):
+    def speech_start(request: Request, value: SpeechStart | None = None):
         owner = client(request)
         def start_owned():
-            result = speech.start(owner)
+            result = speech.start(owner, value.language if value else "Auto")
             try:
                 client(request)  # Native model loading can outlive credential revocation.
             except HTTPException:

@@ -1,4 +1,4 @@
-import { endpoint, sha, verifyResults, canonical } from "./protocol.js";
+import { endpoint, sha, verifyResults, canonical, speechLanguage } from "./protocol.js";
 import * as cache from "./cache.js";
 import {createVideoJobs} from './video_jobs.js';
 import {speechPhrase, takeSpeechEvents} from './speech_phrases.js';
@@ -196,42 +196,69 @@ async function audioStop(tabId, expectedSession = null, invalidateStart = true) 
     try { await chrome.runtime.sendMessage({type:'OFFSCREEN_STOP',tabId}); } catch {}
     return;
   }
+  clearTimeout(session.phraseTimer);
   try { await chrome.runtime.sendMessage({type:"OFFSCREEN_STOP",tabId,captureId:session.captureId}); } catch {}
   if (session.sid) await cancelSpeech(session.cfg, session.sid);
   for (const old of session.retired || []) await cancelSpeech(old.cfg,old.sid);
 }
 
 async function sendSpeech(tabId, events, session) {
-  for (const event of events || []) {
-    if (audioSessions.get(tabId) !== session) return;
-    const final = !!(event.segment_final || event.final);
-    const stable = String(event.stable_text || '');
-    const phrase = speechPhrase(stable, session.committed, final);
-    if (phrase.text && (final || Date.now() - (session.lastPhraseAt || 0) >= 900)) {
-      try {
-        const accepted = await chrome.tabs.sendMessage(tabId, {type:'IT_VIDEO_SPEECH',source:phrase.text,speechEpoch:session.speechEpoch});
-        if (accepted?.stale) return;
-        if (!accepted?.queued) throw new Error('视频翻译队列未接受语音文本');
+  // Timer flushes and feed replies share a queue so an awaited page message
+  // cannot allow the same stable prefix to be submitted twice.
+  session.phraseQueue = (session.phraseQueue || Promise.resolve()).then(async () => {
+    const pending = events?.length ? events : session.pendingSpeechEvent ? [session.pendingSpeechEvent] : [];
+    for (const event of pending) {
+      if (audioSessions.get(tabId) !== session) return;
+      clearTimeout(session.phraseTimer);
+      session.pendingSpeechEvent = null;
+      const final = !!(event.segment_final || event.final);
+      const stable = String(event.stable_text || '');
+      const language = event.language;
+      const interval = language === 'Japanese' ? 400 : 900;
+      if (stable.slice(session.committed.length).trim())
+        session.phrasePendingSince ??= Date.now();
+      else session.phrasePendingSince = null;
+      const phrase = speechPhrase(stable, session.committed, final,
+        {language, pendingMs: Date.now() - (session.phrasePendingSince ?? Date.now())});
+      if (phrase.text && (final || Date.now() - (session.lastPhraseAt || 0) >= interval)) {
+        try {
+          const accepted = await chrome.tabs.sendMessage(tabId, {type:'IT_VIDEO_SPEECH',source:phrase.text,speechEpoch:session.speechEpoch});
+          if (audioSessions.get(tabId) !== session || accepted?.stale) return;
+          if (!accepted?.queued) throw new Error('视频翻译队列未接受语音文本');
+          session.committed = phrase.committed;
+          session.lastPhraseAt = Date.now();
+          session.phrasePendingSince = stable.slice(session.committed.length).trim() ? Date.now() : null;
+          session.lastPreview = '';
+        }
+        catch { await audioStop(tabId, session); return; }
+      } else if (!phrase.text) {
+        // A sentence mark arriving after a timed Japanese flush needs no job.
         session.committed = phrase.committed;
-        session.lastPhraseAt = Date.now();
-        session.lastPreview = '';
       }
-      catch { await audioStop(tabId, session); }
-    }
-    if (!final) {
-      const preview = String(event.preview_text || "");
-      const text = (preview.startsWith(session.committed)
-        ? preview.slice(session.committed.length) : preview).trim().slice(-300);
-      if (text && text !== session.lastPreview) {
-        session.lastPreview = text;
-        try { await chrome.tabs.sendMessage(tabId, {type:"IT_VIDEO_SPEECH_PREVIEW",source:text,speechEpoch:session.speechEpoch}); }
-        catch { await audioStop(tabId, session); }
+      if (!final) {
+        if (language === 'Japanese' && speechPhrase(stable, session.committed, false, {language, pendingMs: 1200}).text) {
+          session.pendingSpeechEvent = event;
+          const ready = speechPhrase(stable, session.committed, false, {language}).text;
+          const wait = ready ? 0 : 1200 - (Date.now() - session.phrasePendingSince);
+          session.phraseTimer = setTimeout(() => sendSpeech(tabId, [], session)
+            .catch(() => audioStop(tabId, session)), Math.max(50, wait, interval - (Date.now() - (session.lastPhraseAt || 0))));
+        }
+        const preview = String(event.preview_text || "");
+        const text = (preview.startsWith(session.committed)
+          ? preview.slice(session.committed.length) : preview).trim().slice(-300);
+        if (text && text !== session.lastPreview) {
+          session.lastPreview = text;
+          try { await chrome.tabs.sendMessage(tabId, {type:"IT_VIDEO_SPEECH_PREVIEW",source:text,speechEpoch:session.speechEpoch}); }
+          catch { await audioStop(tabId, session); return; }
+        }
+        continue;
       }
-      continue;
+      session.committed = stable;
+      session.phrasePendingSince = null;
+      session.lastPreview = "";
     }
-    session.committed = stable;
-    session.lastPreview = "";
-  }
+  });
+  return session.phraseQueue;
 }
 
 async function audioFeed(tabId, value) {
@@ -261,12 +288,7 @@ async function audioFeed(tabId, value) {
       const terminal = takeSpeechEvents(final, current.asrRevision, true);
       await sendSpeech(tabId, terminal.events, current);
       current.asrRevision = terminal.revision;
-      const next = await api(current.cfg, "/api/speech/start", "POST", {}, 180000);
-      if (audioSessions.get(tabId) !== current) {
-        await cancelSpeech(current.cfg, next.session_id);
-        return;
-      }
-      current.sid = next.session_id;
+      if (!await openSpeechSession(current, () => audioSessions.get(tabId) === current)) return;
       current.seq = current.samples = 0;
       current.asrRevision = 0;
       current.committed = "";
@@ -343,10 +365,28 @@ async function audioFinish(tabId, speechEpoch) {
   return session.finishing;
 }
 
-function audioStart(tabId, streamId, cfg, speechEpoch) {
+async function openSpeechSession(session, alive) {
+  while (alive()) {
+    const language = session.speechLanguage;
+    const result = await api(session.cfg, "/api/speech/start", "POST", {language}, 180000);
+    if (!alive() || session.speechLanguage !== language) {
+      await cancelSpeech(session.cfg, result.session_id);
+      continue;
+    }
+    if (language !== "Auto" && result.language !== language) {
+      await cancelSpeech(session.cfg, result.session_id);
+      throw new Error("后端未确认指定的识别语言，请更新后端后重试");
+    }
+    session.sid = result.session_id;
+    return true;
+  }
+  return false;
+}
+
+function audioStart(tabId, streamId, cfg, speechEpoch, language = "Auto") {
   audioTargetTab = tabId;
   const generation = ++audioStartGeneration;
-  const intent = {speechEpoch,session:null};
+  const intent = {speechEpoch,speechLanguage:speechLanguage(language),session:null};
   audioIntents.set(tabId,intent);
   const result = audioStarts.then(() => audioStartNow(tabId, streamId, cfg, generation, intent)).finally(() => {
     if (audioIntents.get(tabId) === intent) audioIntents.delete(tabId);
@@ -358,7 +398,7 @@ async function audioStartNow(tabId, streamId, cfg, generation, intent) {
   if (generation !== audioStartGeneration) return;
   for (const id of [...audioSessions.keys()]) await audioStop(id, null, false);
   if (generation !== audioStartGeneration) return;
-  const session = {cfg, speechEpoch:intent.speechEpoch, captureId:crypto.randomUUID(), sid:null, seq:0, samples:0,
+  const session = {cfg, speechEpoch:intent.speechEpoch, speechLanguage:intent.speechLanguage, captureId:crypto.randomUUID(), sid:null, seq:0, samples:0,
     committed:"", asrRevision:0, lastPreview:"", queue:Promise.resolve()};
   intent.session = session;
   audioSessions.set(tabId, session);
@@ -375,14 +415,10 @@ async function audioStartNow(tabId, streamId, cfg, generation, intent) {
     if (audioSessions.get(tabId) !== session) return;
     if (!status.capabilities?.includes("speech_r2t2_v1"))
       throw new Error("请升级独立整合包，安装 R2T2 语音组件");
-    const result = await api(cfg, "/api/speech/start", "POST", {}, 180000);
-    if (audioSessions.get(tabId) !== session) {
-      await cancelSpeech(cfg, result.session_id);
-      return;
-    }
-    session.sid = result.session_id;
+    if (!await openSpeechSession(session, () => audioSessions.get(tabId) === session)) return;
     const playback = await chrome.tabs.sendMessage(tabId, {type:"IT_VIDEO_SPEECH",source:"",ready:true,speechEpoch:session.speechEpoch});
     if (audioSessions.get(tabId) !== session) return;
+    if (!playback?.shown) { await audioStop(tabId, session); return; }
     session.paused = !!playback?.paused;
     await chrome.runtime.sendMessage({type:"OFFSCREEN_READY",tabId,captureId:session.captureId,paused:session.paused});
   } catch (error) {
@@ -392,20 +428,26 @@ async function audioStartNow(tabId, streamId, cfg, generation, intent) {
     }
   }
 }
-function audioRestart(tabId, speechEpoch) {
+function audioRestart(tabId, speechEpoch, language) {
   const former = audioSessions.get(tabId), intent = audioIntents.get(tabId);
+  const selectedLanguage = speechLanguage(language ?? former?.speechLanguage ?? intent?.speechLanguage);
   // Before initial ASR readiness no PCM is accepted yet. Coalesce seeks into
   // that start instead of invalidating it and losing its authorized stream.
   if (intent && (!former || (former === intent.session && !former.sid))) {
     intent.speechEpoch = speechEpoch;
-    if (former) former.speechEpoch = speechEpoch;
+    intent.speechLanguage = selectedLanguage;
+    if (former) {
+      former.speechEpoch = speechEpoch;
+      former.speechLanguage = selectedLanguage;
+    }
     return audioStarts.then(() => ({restarted:audioSessions.get(tabId)?.speechEpoch === speechEpoch &&
       !!audioSessions.get(tabId)?.sid}));
   }
-  if (!former) return Promise.resolve({restarted:false});
+  if (!former) return Promise.resolve({restarted:audioTargetTab === tabId, pending:audioTargetTab === tabId});
+  clearTimeout(former.phraseTimer);
   audioTargetTab = tabId;
   const generation = ++audioStartGeneration;
-  const current = {cfg:former.cfg,speechEpoch,captureId:former.captureId,sid:null,seq:0,samples:0,
+  const current = {cfg:former.cfg,speechEpoch,speechLanguage:selectedLanguage,captureId:former.captureId,sid:null,seq:0,samples:0,
     committed:'',asrRevision:0,lastPreview:'',queue:Promise.resolve(),
     retired:[...(former.retired || []),...(former.sid ? [{cfg:former.cfg,sid:former.sid}] : [])]};
   // Change ownership synchronously, including while another audio start is
@@ -423,11 +465,10 @@ function audioRestart(tabId, speechEpoch) {
       current.retired = [];
       if (!alive()) return {restarted:false};
       if (!reset?.ok) throw new Error(reset?.error || '视频声音采集已结束，请重新启用语音翻译');
-      const started = await api(current.cfg,'/api/speech/start','POST',{},180000);
-      if (!alive()) { await cancelSpeech(current.cfg,started.session_id); return {restarted:false}; }
-      current.sid = started.session_id;
+      if (!await openSpeechSession(current, alive)) return {restarted:false};
       const playback = await chrome.tabs.sendMessage(tabId,{type:'IT_VIDEO_SPEECH',source:'',ready:true,speechEpoch});
       if (!alive()) return {restarted:false};
+      if (!playback?.shown) { await audioStop(tabId, current); return {restarted:false}; }
       current.paused = !!playback?.paused;
       await chrome.runtime.sendMessage({type:'OFFSCREEN_READY',tabId,captureId:current.captureId,paused:current.paused});
       if (!alive()) return {restarted:false};
@@ -465,7 +506,10 @@ async function startVideoForTab(tabId, forceSpeech, targetIndex = null) {
       const streamId = await chrome.tabCapture.getMediaStreamId({targetTabId:tabId});
       const cfg = await config();
       if (generation !== audioStartGeneration) return {mode:"none",reason:"视频翻译已取消，请重试"};
-      audioStart(tabId, streamId, cfg, result.speechEpoch).catch(() => {});
+      const playback = await chrome.tabs.sendMessage(tabId, {type:"IT_VIDEO_EPOCH"}, {frameId:0});
+      if (generation !== audioStartGeneration || !playback?.active || playback.mode !== "speech")
+        return {mode:"none",reason:"视频翻译已取消，请重试"};
+      audioStart(tabId, streamId, cfg, playback.speechEpoch, playback.speechLanguage).catch(() => {});
     } catch (error) {
       const note = "声音授权失败：" + (error.message || "Chrome 未允许标签页采集") + "。请确认已允许本扩展访问当前网站，重新打开工具栏 T8 扩展后再点「直接识别声音」。";
       await chrome.tabs.sendMessage(tabId, {type:"IT_VIDEO_SPEECH",source:"",note,speechEpoch:result.speechEpoch}, {frameId:0});
@@ -836,7 +880,7 @@ async function handle(message, sender) {
     if (typeof message.speechEpoch !== 'string' || !/^[a-zA-Z0-9_-]{8,100}$/.test(message.speechEpoch))
       throw new Error('无效的视频播放位置编号');
     // Ownership must change before any asynchronous storage/config read.
-    return audioRestart(sender.tab.id,message.speechEpoch);
+    return audioRestart(sender.tab.id,message.speechEpoch,message.speechLanguage);
   }
   if (message.type === "VIDEO_CONTROL" && page(sender)) {
     if (message.action === "stop") {
@@ -1034,7 +1078,7 @@ async function handle(message, sender) {
       throw new Error("标签页音频授权已过期，请重新启动视频翻译");
     captureGrants.delete(message.tabId);
     const playback = await chrome.tabs.sendMessage(message.tabId,{type:'IT_VIDEO_EPOCH'},{frameId:0});
-    audioStart(message.tabId, message.streamId, cfg, playback?.speechEpoch).catch(async error => {
+    audioStart(message.tabId, message.streamId, cfg, playback?.speechEpoch, playback?.speechLanguage).catch(async error => {
       try { await chrome.tabs.sendMessage(message.tabId, {
         type:"IT_VIDEO_SPEECH",source:"",note:error.message,speechEpoch:playback?.speechEpoch}); } catch {}
     });

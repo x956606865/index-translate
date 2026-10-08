@@ -19,6 +19,8 @@
 | [workstreams/ACTIVE_WORKSTREAM.md](workstreams/ACTIVE_WORKSTREAM.md) | 当前指针；目前 NONE |
 | [mini/2026-10-08-repository-init.md](mini/2026-10-08-repository-init.md) | 本次初始化范围、风险和验证记录 |
 | [mini/2026-10-08-local-translation.md](mini/2026-10-08-local-translation.md) | Alt 选区/悬停段落翻译、页内双语呈现的实现与验证记录 |
+| [mini/2026-10-08-page-speech-language.md](mini/2026-10-08-page-speech-language.md) | 当前页面语音识别语言临时锁定、后端协议与验证记录 |
+| [mini/2026-10-08-japanese-speech-latency.md](mini/2026-10-08-japanese-speech-latency.md) | 日语语音译第一版：短语提前发送、等待时限、定时任务隔离与实机对比清单 |
 | [backend/ai-wiki/INDEX.md](../backend/ai-wiki/INDEX.md) | backend 导入前的索引/实施记录；相关规则变化时结合当前源码核实 |
 | [backend/ai-wiki/mini/2026-10-07-fixed-pairing.md](../backend/ai-wiki/mini/2026-10-07-fixed-pairing.md) | backend 导入前的索引/实施记录；相关规则变化时结合当前源码核实 |
 | [backend/ai-wiki/mini/2026-10-07-speech-loopback.md](../backend/ai-wiki/mini/2026-10-07-speech-loopback.md) | backend 导入前的索引/实施记录；相关规则变化时结合当前源码核实 |

@@ -1,6 +1,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 let tab, cfg;
+let languageChanging = false;
 let videoStarting = false, videoStopping = false, videoRevision = 0, videoTouched = false, videoRefreshBusy = false;
 const languages = {
   zh: "中文",
@@ -45,6 +46,35 @@ async function inject() {
     files: ["content.js", "video.js"],
   });
 }
+async function refreshLanguage(language) {
+  const reply = await chrome.tabs.sendMessage(tab.id, {
+    type:"IT_VIDEO_LANGUAGE", expectedUrl:tab.url, ...(language === undefined ? {} : {language}),
+  }, {frameId:0});
+  if (!reply?.ok) throw new Error(reply?.error || "无法读取当前页面的识别语言");
+  const select = $("speech-language");
+  select.replaceChildren(...Object.entries(reply.value.languages).map(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    return option;
+  }));
+  select.value = reply.value.language;
+}
+$("speech-language").addEventListener("change", async () => {
+  languageChanging = true;
+  $("speech-language").disabled = true;
+  videoTell("正在更新当前页面的识别语言…");
+  try {
+    await refreshLanguage($("speech-language").value);
+    videoTell("当前页面识别语言：" + $("speech-language").selectedOptions[0].textContent);
+  } catch (error) {
+    videoTell(error.message, true);
+    try { await refreshLanguage(); } catch {}
+  } finally {
+    languageChanging = false;
+    $("speech-language").disabled = false;
+  }
+});
 async function preferences() {
   cfg.target = $("target").value;
   await message({
@@ -76,7 +106,7 @@ $("restore").addEventListener("click", async () => {
   }
 });
 async function startVideo(forceSpeech = false) {
-  if (videoStarting || videoStopping) return;
+  if (videoStarting || videoStopping || languageChanging) return;
   const stamp = ++videoRevision;
   videoStarting = true;
   videoTouched = true;
@@ -115,12 +145,12 @@ function videoTell(text, error = false) {
   $("video-message").classList.toggle("error",error);
 }
 async function refreshVideo() {
-  if (!tab || videoStarting || videoStopping || videoRefreshBusy) return;
+  if (!tab || videoStarting || videoStopping || languageChanging || videoRefreshBusy) return;
   const stamp = videoRevision;
   videoRefreshBusy = true;
   try {
     const state = await message({type:"VIDEO_STATUS_UI",tabId:tab.id});
-    if (stamp !== videoRevision || videoStarting || videoStopping) return;
+    if (stamp !== videoRevision || videoStarting || videoStopping || languageChanging) return;
     if (state.phase !== "idle" || !videoTouched) videoTell(state.note,!!state.error);
   } catch(error) {
     if (videoTouched && stamp === videoRevision) videoTell("声音识别状态暂时无法确认：" + error.message,true);
@@ -204,6 +234,13 @@ async function initialize() {
       } catch (error) {
         tell(error.message, true);
       }
+    }
+    if (tab && /^https?:\/\//.test(tab.url)) {
+      try {
+        await chrome.scripting.executeScript({target:{tabId:tab.id},files:["video.js"]});
+        await refreshLanguage();
+        $("speech-language").disabled = false;
+      } catch (error) { videoTell(error.message, true); }
     }
     await refresh();
     await refreshVideo();

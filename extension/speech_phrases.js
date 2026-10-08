@@ -11,7 +11,7 @@ export function takeSpeechEvents(reply, previous = 0, snapshot = false) {
 
 // Translate only the ASR engine's append-only stable prefix, never preview drafts.
 const abbreviations = new Set(['dr','mr','mrs','ms','prof','sr','jr','st','vs','etc','e.g','i.e']);
-export function speechPhrase(stable, committed = '', final = false) {
+export function speechPhrase(stable, committed = '', final = false, {language = '', pendingMs = 0} = {}) {
   if (!stable.startsWith(committed)) throw new Error('语音识别已修改确认文本，请重新启动');
   const pending = stable.slice(committed.length);
   let end = final ? pending.length : 0;
@@ -21,6 +21,18 @@ export function speechPhrase(stable, committed = '', final = false) {
       const word = before.match(/([A-Za-z]+(?:\.[A-Za-z]+)*)$/)?.[1] || '';
       if (match[0] === '.' && (abbreviations.has(word.toLowerCase()) || /^(?:[A-Z]\.)*[A-Z]$/.test(word))) continue;
       end = match.index + match[0].length;
+    }
+    if (!end && language === 'Japanese') {
+      const limited = pending.slice(0, 60);
+      for (const match of limited.matchAll(/[、，,]/g))
+        if ((limited.slice(0, match.index).match(/\p{L}/gu) || []).length >= 6)
+          end = match.index + 1;
+      // Stable Japanese mixes kana and kanji without spaces. Bound its wait
+      // even when ASR has not produced punctuation or a segment-final event.
+      if (!end && pendingMs >= 1200 && (limited.match(/\p{L}/gu) || []).length >= 3) {
+        end = limited.length;
+        if (/^[\uD800-\uDBFF]$/.test(limited[end - 1]) && /^[\uDC00-\uDFFF]$/.test(pending[end])) --end;
+      }
     }
     if (!end && (pending.trim().split(/\s+/).length >= 12 || /[\u3400-\u9fff]{24}/.test(pending))) {
       const limited = pending.slice(0,120);
@@ -34,5 +46,9 @@ export function speechPhrase(stable, committed = '', final = false) {
       }
     }
   }
-  return {text: pending.slice(0,end).trim(), committed: committed + pending.slice(0,end)};
+  const text = pending.slice(0,end).trim();
+  return {
+    text: language === 'Japanese' && !/[\p{L}\p{N}]/u.test(text) ? '' : text,
+    committed: committed + pending.slice(0,end),
+  };
 }

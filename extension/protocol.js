@@ -1,3 +1,10 @@
+export function speechLanguage(value = "Auto") {
+  if (!["Auto", "Chinese", "English", "Cantonese", "Japanese", "Korean", "German",
+    "French", "Russian", "Portuguese", "Spanish", "Italian"].includes(value))
+    throw new Error("不支持的语音识别语言");
+  return value;
+}
+
 export function endpoint(value) {
   const url = new URL(value);
   const octets = url.hostname.split(".").map(Number);
