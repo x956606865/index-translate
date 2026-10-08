@@ -38,6 +38,189 @@
     });
   }
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  let pointer = null, altPending = false, quick = null;
+  const quickOutputs = new Map();
+  const EDITABLE = 'input,textarea,select,[contenteditable]:not([contenteditable="false"]),[role="textbox"]';
+
+  function stopQuick(restore = false) {
+    const old = quick;
+    quick = null;
+    if (old) {
+      old.output.remove();
+      quickOutputs.delete(old.anchor);
+      if (old.submitted)
+        message({ type: "CANCEL", page_epoch: old.epoch }).catch(() => {});
+    }
+    for (const [anchor, output] of quickOutputs)
+      if (restore || !anchor.isConnected || !output.isConnected) {
+        output.remove();
+        quickOutputs.delete(anchor);
+      }
+  }
+
+  function quickTarget() {
+    const selection = window.getSelection();
+    let range, block;
+    if (selection && !selection.isCollapsed && selection.rangeCount) {
+      range = selection.getRangeAt(0);
+    } else {
+      if (!pointer) return null;
+      const hit = document.elementFromPoint(pointer.x, pointer.y);
+      if (!hit || hit.closest(SKIP)) return null;
+      block = hit.closest(BLOCK);
+      if (!block) return null;
+      range = document.createRange();
+      range.selectNodeContents(block);
+    }
+    const container = range.commonAncestorContainer;
+    if (container.getRootNode() !== document) return null;
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+    const parts = [];
+    let node = container.nodeType === 3 ? container : walker.nextNode();
+    let previousBlock, lastNode, error, size = 0;
+    while (node) {
+      if (node.nodeType !== 3) {
+        if (node.tagName === "BR" && !node.closest(SKIP) &&
+            (!block || node.closest(BLOCK) === block) && range.intersectsNode(node))
+          parts.push("\n");
+        node = walker.nextNode();
+        continue;
+      }
+      const parent = node.parentElement;
+      const currentBlock = parent?.closest(BLOCK);
+      if (parent && !parent.closest(SKIP) && !parent.closest(EDITABLE) &&
+          (!block || currentBlock === block) && range.intersectsNode(node)) {
+        const style = getComputedStyle(parent);
+        const piece = document.createRange();
+        piece.selectNodeContents(node);
+        if (node === range.startContainer) piece.setStart(node, range.startOffset);
+        if (node === range.endContainer) piece.setEnd(node, range.endOffset);
+        const text = piece.toString();
+        if (style.visibility === "visible" && style.display !== "none" &&
+            piece.getClientRects().length && text) {
+          if (previousBlock && previousBlock !== currentBlock) parts.push("\n");
+          parts.push(text);
+          previousBlock = currentBlock;
+          lastNode = node;
+          size += text.length;
+          if (size > 11200) {
+            error = "文字过长，请缩小选区后重试";
+            break;
+          }
+        }
+      }
+      node = walker.nextNode();
+    }
+    const text = parts.join("").trim();
+    if (!text || !lastNode || !previousBlock) return null;
+    let anchor = lastNode;
+    while (anchor.parentElement !== previousBlock) anchor = anchor.parentElement;
+    // Finish the source run so a selection inside an inline tag does not split
+    // the original paragraph. Stop before the next independent block.
+    for (let next = anchor.nextSibling; next; next = next.nextSibling) {
+      if (next.nodeType === 1 && next.matches("[data-index-owned]")) continue;
+      if (isBoundary(next) || !eligible(next)) break;
+      anchor = next;
+    }
+    return { text, anchor, error };
+  }
+
+  async function translateQuick() {
+    const target = quickTarget();
+    if (!target) return;
+    stopQuick();
+    quickOutputs.get(target.anchor)?.remove();
+    const output = document.createElement("span");
+    output.dataset.indexOwned = "quick-translation";
+    output.dataset.indexTranslation = uuid();
+    output.dir = "auto";
+    output.setAttribute("role", "status");
+    output.setAttribute("aria-live", "polite");
+    output.textContent = target.error || "模型加载或翻译中…";
+    target.anchor.after(output);
+    quickOutputs.set(target.anchor, output);
+    if (target.error) return;
+    const current = { output, anchor: target.anchor, epoch: uuid(), url: location.href, submitted: false };
+    quick = current;
+    const alive = () => quick === current && output.isConnected &&
+      target.anchor.isConnected && output.parentElement === target.anchor.parentElement &&
+      location.href === current.url;
+    const requestId = uuid();
+    try {
+      const pieces = chunks(target.text);
+      if (pieces.length > 16) throw new Error("文字过长，请缩小选区后重试");
+      const preferences = await message({ type: "PUBLIC" });
+      if (!alive()) return;
+      output.lang = preferences.target;
+      const paragraphs = pieces.map((text, i) => ({ id: `${requestId}:${i}`, text }));
+      const submit = { type: "SUBMIT", request_id: requestId,
+        page_epoch: current.epoch, preferences: {
+          source: preferences.source, target: preferences.target, glossary: preferences.glossary,
+        }, paragraphs };
+      current.submitted = true;
+      try { await message(submit); }
+      catch {
+        await delay(800);
+        if (!alive()) return;
+        await message(submit);
+      }
+      while (alive()) {
+        const job = await message({ type: "POLL", request_id: requestId, page_epoch: current.epoch });
+        if (!alive()) return;
+        if (job.status === "completed") {
+          const values = new Map(job.results.map((r) => [r.id, r.text]));
+          output.textContent = paragraphs.map((p) => {
+            if (typeof values.get(p.id) !== "string") throw new Error("缺少译文");
+            return values.get(p.id);
+          }).join("\n");
+          return;
+        }
+        if (["failed", "cancelled"].includes(job.status))
+          throw new Error(job.error || "任务已取消");
+        await delay(1200);
+      }
+    } catch (error) {
+      if (alive()) {
+        output.textContent = `翻译未完成 · ${error.message}。请轻按 Alt 重试。`;
+      }
+    } finally {
+      if (quick === current) quick = null;
+      if (current.submitted)
+        await message({ type: "FORGET", request_id: requestId, page_epoch: current.epoch }).catch(() => {});
+    }
+  }
+
+  document.addEventListener("pointermove", (event) => {
+    pointer = { x: event.clientX, y: event.clientY };
+  }, { passive: true });
+  document.addEventListener("pointerout", (event) => {
+    if (!event.relatedTarget) pointer = null;
+  });
+  document.addEventListener("pointerdown", () => { altPending = false; }, true);
+  document.addEventListener("keydown", (event) => {
+    if (!event.isTrusted) return;
+    if (event.key === "Escape") stopQuick();
+    if (event.key !== "Alt") { altPending = false; return; }
+    if (event.repeat) return;
+    altPending = !event.defaultPrevented && !event.ctrlKey && !event.metaKey &&
+      !event.shiftKey && !event.isComposing &&
+      !event.composedPath().some((node) => node.matches?.(EDITABLE)) &&
+      !document.activeElement?.closest(EDITABLE);
+  }, true);
+  document.addEventListener("keyup", (event) => {
+    if (!event.isTrusted) return;
+    if (event.key !== "Alt") { altPending = false; return; }
+    const trigger = altPending;
+    altPending = false;
+    if (trigger && !event.defaultPrevented && !event.ctrlKey && !event.metaKey &&
+        !event.shiftKey && !event.isComposing &&
+        !event.composedPath().some((node) => node.matches?.(EDITABLE)) &&
+        !document.activeElement?.closest(EDITABLE)) {
+      event.preventDefault();
+      translateQuick();
+    }
+  }, true);
+  window.addEventListener("blur", () => { altPending = false; pointer = null; });
   function nodeKey(node) {
     if (!nodeKeys.has(node)) nodeKeys.set(node, ++nextNode);
     return nodeKeys.get(node);
@@ -272,6 +455,9 @@
       p.id = id;
       section.append(p);
     }
+    const hint = document.createElement("p");
+    hint.textContent = "轻按 Alt（Mac：Option）：翻译选中文字；未选择时翻译鼠标所在段落。";
+    section.append(hint);
     const actions = document.createElement("div");
     actions.className = "actions";
     for (const [name, action] of [
@@ -707,6 +893,7 @@
         update();
         return;
       }
+      stopQuick(true);
       if (
         enabled &&
         !paused &&
@@ -758,6 +945,8 @@
     }
   }
   async function stop(restore, userInitiated = true) {
+    stopQuick(restore);
+    altPending = false;
     ++lifecycle;
     if (userInitiated) manuallyPaused = true;
     resumeOnPageShow = false;
