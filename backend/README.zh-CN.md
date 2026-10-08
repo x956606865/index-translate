@@ -1,5 +1,7 @@
 # Index Translate Windows 本地整合包
 
+> **个人修改维护版：本 Windows 后端基于 T8（T8star-Aix / T8mars）的 [Comfyui-Index-Translate-T8](https://github.com/T8mars/Comfyui-Index-Translate-T8) 代码修改而来。感谢原作者的开发与开源工作。** 后续个人改动由 [x956606865/index-translate](https://github.com/x956606865/index-translate) 独立维护，不代表 T8 官方发布。改动范围与当前维护说明见 [仓库 README](../README.md)，原有许可与署名继续保留。
+
 0.1.20 本地修复：双击 `T8IndexTranslate.exe` 或 `start.cmd` 后保留一个任务栏窗口，显示 **By T8star**，支持重新打开网页和停止服务。点击窗口关闭按钮或「停止服务并退出」会先取消任务、关闭语音 worker、卸载翻译模型并等待本整合包的服务退出；加载或编译中关闭可能需要等待。重复启动复用同一窗口与服务。原有模型路径、配对、设置与任务数据保留。
 
 「加载并预热」旁新增持续状态：排队、模型加载/编译耗时、核实结果、已完成（绿色）或具体错误；按钮完成后恢复「重新预热」。支持取消和失败重试，刷新页面继续追踪同一个任务。超过五分钟仍保持追踪；网络暂时中断后恢复，不把灰色按钮当作完成状态。模型卸载后显示未加载。常规 eager 回退会明确说明，不能当作编译加速成功。

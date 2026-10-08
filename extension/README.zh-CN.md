@@ -1,5 +1,7 @@
 # T8 Index Translate 本地网页翻译
 
+> **个人修改维护版：本 Chrome 插件基于 T8（T8star-Aix / T8mars）的 [Comfyui-Index-Translate-T8](https://github.com/T8mars/Comfyui-Index-Translate-T8) 代码修改而来。感谢原作者的开发与开源工作。** 后续个人改动由 [x956606865/index-translate](https://github.com/x956606865/index-translate) 独立维护，不代表 T8 官方发布。改动范围与当前维护说明见 [仓库 README](../README.md)，原有许可与署名继续保留。
+
 ## 选中文字 / 鼠标段落翻译
 
 在普通网页中，选中需要翻译的文字后，单独轻按并松开 **Alt**（Mac 使用 **Option**），译文会紧挨原文段落下方显示，沿用整页翻译的双语对照样式。没有选区时，将鼠标移到要读的段落上，再轻按同一按键，即可翻译该段。目标语言沿用插件设置。
